@@ -1,10 +1,11 @@
 """
 =======================================================
-  SMC Liquidity Sweep Reversal Bot — v1.0
+  Trend Following Breakout Bot — v1.0
   Pairs    : 18 pair forex + komoditas
-  Strategy : Liquidity Sweep Reversal
-             4H trend → 1H sweep level → 1H reversal candle
-             → 15M konfirmasi → Entry
+  Strategy : Trend Following + Breakout Entry
+             1D trend → 4H struktur → 1H breakout level
+             → 15M konfirmasi momentum → Entry
+             + Anti-Reversal Filter (CHoCH & RSI divergence)
   AI       : Groq Llama3 (analisis makro ekonomi)
   Data     : yfinance + FRED API + NewsAPI
   Notif    : Telegram
@@ -88,7 +89,27 @@ def get_data(symbol, interval, period):
         return None
 
 # ─────────────────────────────────────────────
-# STRUKTUR MARKET
+# INDIKATOR TEKNIKAL
+# ─────────────────────────────────────────────
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain  = delta.clip(lower=0)
+    loss  = -delta.clip(upper=0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs  = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calc_adr(df, lookback=14):
+    """Average Daily Range — mengukur volatilitas rata-rata."""
+    return (df["high"] - df["low"]).tail(lookback).mean()
+
+# ─────────────────────────────────────────────
+# DETEKSI TREN UTAMA
 # ─────────────────────────────────────────────
 def find_swing_points(df, lookback=30):
     highs = []
@@ -103,260 +124,370 @@ def find_swing_points(df, lookback=30):
             lows.append((i, data["low"].iloc[i]))
     return highs, lows
 
-def detect_structure(df):
-    if len(df) < 15:
+def detect_trend(df, label=""):
+    """
+    Menentukan tren berdasarkan:
+    1. EMA 50 vs EMA 200 — filter tren makro
+    2. Struktur swing HH/HL atau LL/LH
+    3. Harga di atas/bawah EMA 50
+
+    Return: "UPTREND", "DOWNTREND", atau "SIDEWAYS"
+    """
+    if len(df) < 50:
         return "SIDEWAYS"
-    swing_highs, swing_lows = find_swing_points(df, lookback=40)
-    if len(swing_highs) < 2 or len(swing_lows) < 2:
-        return "SIDEWAYS"
-    sh1 = swing_highs[-2][1]
-    sh2 = swing_highs[-1][1]
-    sl1 = swing_lows[-2][1]
-    sl2 = swing_lows[-1][1]
-    hh  = sh2 > sh1
-    hl  = sl2 > sl1
-    ll  = sl2 < sl1
-    lh  = sh2 < sh1
-    if hh and hl:
-        return "UPTREND"
-    elif ll and lh:
-        return "DOWNTREND"
-    return "SIDEWAYS"
+
+    ema50  = calc_ema(df["close"], 50)
+    ema200 = calc_ema(df["close"], 200) if len(df) >= 200 else None
+    price  = df["close"].iloc[-1]
+    e50    = ema50.iloc[-1]
+
+    swing_highs, swing_lows = find_swing_points(df, lookback=50)
+
+    structure = "SIDEWAYS"
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        sh1, sh2 = swing_highs[-2][1], swing_highs[-1][1]
+        sl1, sl2 = swing_lows[-2][1],  swing_lows[-1][1]
+        hh = sh2 > sh1
+        hl = sl2 > sl1
+        ll = sl2 < sl1
+        lh = sh2 < sh1
+        if hh and hl:
+            structure = "UPTREND"
+        elif ll and lh:
+            structure = "DOWNTREND"
+
+    # Konfirmasi dengan EMA
+    if structure == "UPTREND":
+        if price < e50 * 0.998:          # harga jauh di bawah EMA50 → lemahkan sinyal
+            structure = "SIDEWAYS"
+    elif structure == "DOWNTREND":
+        if price > e50 * 1.002:
+            structure = "SIDEWAYS"
+
+    # Jika ada EMA200, tren harus sejalan
+    if ema200 is not None:
+        e200 = ema200.iloc[-1]
+        if structure == "UPTREND"   and e50 < e200:
+            structure = "SIDEWAYS"
+        if structure == "DOWNTREND" and e50 > e200:
+            structure = "SIDEWAYS"
+
+    if label:
+        print(f"[TREND] {label}: {structure} | price={round(price,4)} EMA50={round(e50,4)}")
+    return structure
 
 # ─────────────────────────────────────────────
-# EQUAL HIGHS / LOWS (liquidity magnet)
+# DETEKSI BREAKOUT LEVEL (1H)
 # ─────────────────────────────────────────────
-def detect_equal_levels(df, lookback=20, tolerance=0.0015):
+def find_breakout_level(df, trend, lookback=30):
     """
-    Cari equal highs dan equal lows — zona di mana
-    stop loss banyak trader menumpuk (liquidity pool).
-    Tolerance default 0.15% dari harga.
+    Cari level kunci yang kemungkinan akan di-break sesuai tren.
+
+    UPTREND  → cari resistance terdekat (swing high / equal high)
+               yang harga belum pernah melewatinya
+    DOWNTREND→ cari support terdekat (swing low / equal low)
+
+    Return: level (float) atau None
     """
-    data   = df.tail(lookback)
-    eq_high = None
-    eq_low  = None
-    highs  = data["high"].values
-    lows   = data["low"].values
+    data         = df.tail(lookback).reset_index(drop=True)
+    current_high = data["high"].max()
+    current_low  = data["low"].min()
+    current_close = df["close"].iloc[-2]
 
-    # Cari pasangan high yang hampir sama
-    for i in range(len(highs) - 1):
-        for j in range(i + 1, len(highs)):
-            if highs[i] > 0 and abs(highs[i] - highs[j]) / highs[i] < tolerance:
-                eq_high = max(highs[i], highs[j])
-                break
-        if eq_high:
-            break
+    swing_highs, swing_lows = find_swing_points(data, lookback=lookback)
 
-    # Cari pasangan low yang hampir sama
-    for i in range(len(lows) - 1):
-        for j in range(i + 1, len(lows)):
-            if lows[i] > 0 and abs(lows[i] - lows[j]) / lows[i] < tolerance:
-                eq_low = min(lows[i], lows[j])
-                break
-        if eq_low:
-            break
+    if trend == "UPTREND":
+        # Kumpulkan semua swing high di atas harga saat ini
+        levels = sorted(
+            [s[1] for s in swing_highs if s[1] > current_close],
+            reverse=False
+        )
+        # Cari yang paling dekat (terendah di antara yang lebih tinggi dari harga)
+        if levels:
+            return levels[0]
+        # Fallback: pakai swing high tertinggi dalam lookback
+        if swing_highs:
+            return max(s[1] for s in swing_highs)
 
-    return eq_high, eq_low
+    elif trend == "DOWNTREND":
+        levels = sorted(
+            [s[1] for s in swing_lows if s[1] < current_close],
+            reverse=True
+        )
+        if levels:
+            return levels[0]
+        if swing_lows:
+            return min(s[1] for s in swing_lows)
+
+    return None
 
 # ─────────────────────────────────────────────
-# DETEKSI SWEEP + REVERSAL CANDLE
+# DETEKSI BREAKOUT CANDLE (1H)
 # ─────────────────────────────────────────────
-def detect_sweep_reversal(df, structure, pair=""):
+def detect_breakout(df, trend, breakout_level, pair=""):
     """
-    Cari liquidity sweep diikuti reversal candle di 1H.
+    Konfirmasi breakout valid di 1H:
 
-    Logika:
-    UPTREND  → cari sweep LOW (stop hunt bawah) → reversal naik → BUY
-    DOWNTREND→ cari sweep HIGH (stop hunt atas) → reversal turun → SELL
+    UPTREND:
+    - Close candle > breakout level (bullish breakout)
+    - Body candle cukup besar (bukan false break)
+    - Tidak ada upper wick besar (bukan rejection)
 
-    Tipe reversal yang diakui:
-    1. Pin Bar   — ekor panjang, body kecil
-    2. Engulfing — candle besar menelan candle sebelumnya
-    3. Strong Close — close kuat melewati high/low candle sebelumnya
+    DOWNTREND:
+    - Close candle < breakout level (bearish breakout)
+    - Body candle cukup besar
+    - Tidak ada lower wick besar
+
+    Tipe breakout yang diakui:
+    1. Clean Break      — close melewati level dengan body kuat
+    2. Momentum Break   — candle besar + volume relatif tinggi
+    3. Retest Entry     — breakout + pullback ke level → pantul kembali
+
+    Return: (valid: bool, breakout_type: str atau None)
     """
-    if len(df) < 15:
-        return False, None, None, None
+    if len(df) < 5 or breakout_level is None:
+        return False, None
 
-    # Ambil swing points dari candle yang sudah confirmed (exclude 3 terbaru)
-    swing_highs, swing_lows = find_swing_points(df.iloc[:-2], lookback=30)
-    eq_high, eq_low         = detect_equal_levels(df.iloc[:-2], lookback=20)
-
-    curr = df.iloc[-2]   # candle confirmed terbaru
-    prev = df.iloc[-3]   # candle sebelumnya
-    atr  = (df["high"] - df["low"]).tail(14).mean()
+    curr = df.iloc[-2]    # candle confirmed terbaru
+    prev = df.iloc[-3]
+    atr  = calc_adr(df, 14)
 
     if atr <= 0:
-        return False, None, None, None
+        return False, None
 
-    # ── BUY setup: sweep LOW ──────────────────
-    if structure == "UPTREND":
-        # Kumpulkan level liquidity bawah
-        levels = []
-        if swing_lows:
-            levels += [s[1] for s in swing_lows[-3:]]
-        if eq_low:
-            levels.append(eq_low)
-        if not levels:
-            print(f"[{pair}] Tidak ada level liquidity bawah")
-            return False, None, None, None
+    body       = abs(curr["close"] - curr["open"])
+    upper_wick = curr["high"] - max(curr["open"], curr["close"])
+    lower_wick = min(curr["open"], curr["close"]) - curr["low"]
+    candle_range = curr["high"] - curr["low"]
 
-        sweep_level = min(levels)   # level paling rendah = liquidity utama
+    if trend == "UPTREND":
+        # Harga harus sudah menembus level ke atas
+        if curr["close"] <= breakout_level:
+            print(f"[{pair}] Close {round(curr['close'],4)} belum tembus resistance {round(breakout_level,4)}")
+            return False, None
 
-        # Cek apakah candle current atau previous sweep lalu close di atas
-        curr_swept = curr["low"] < sweep_level and curr["close"] > sweep_level
-        prev_swept = prev["low"] < sweep_level and prev["close"] > sweep_level
+        # Body minimal 35% ATR — bukan fake break
+        if body < atr * 0.35:
+            print(f"[{pair}] Body candle terlalu kecil untuk breakout valid")
+            return False, None
 
-        if not (curr_swept or prev_swept):
-            print(f"[{pair}] Tidak ada sweep low di {round(sweep_level, 4)}")
-            return False, None, None, None
+        # Upper wick tidak lebih besar dari body (tidak ada rejection kuat)
+        if upper_wick > body * 0.8:
+            print(f"[{pair}] Upper wick besar → potensi false breakout atas")
+            return False, None
 
-        # Tentukan candle reversal
-        rev_candle   = curr if curr_swept else prev
-        candle_range = rev_candle["high"] - rev_candle["low"]
-        if candle_range <= 0:
-            return False, None, None, None
+        # Tipe 1: Clean Break — close > level, body > 50% candle range
+        if body >= candle_range * 0.5 and curr["close"] > breakout_level:
+            btype = "🚀 Clean Bullish Break"
 
-        body        = abs(rev_candle["close"] - rev_candle["open"])
-        lower_wick  = min(rev_candle["open"], rev_candle["close"]) - rev_candle["low"]
-        upper_wick  = rev_candle["high"] - max(rev_candle["open"], rev_candle["close"])
-        reversal    = None
+        # Tipe 2: Momentum Break — candle jauh lebih besar dari prev
+        elif body >= abs(prev["close"] - prev["open"]) * 1.5:
+            btype = "💥 Momentum Bullish Break"
 
-        # Pin Bar Bullish — ekor bawah panjang
-        if (lower_wick >= body * 1.5 and
-                lower_wick > upper_wick and
-                rev_candle["close"] > rev_candle["low"] + candle_range * 0.5):
-            reversal = "📍 Pin Bar Bullish"
+        # Tipe 3: Retest Entry — prev break, curr pullback ke level lalu close di atas
+        elif (prev["close"] > breakout_level and
+              curr["low"]   <= breakout_level * 1.001 and
+              curr["close"] > breakout_level):
+            btype = "🔄 Retest Bullish Entry"
 
-        # Engulfing Bullish
-        elif (rev_candle["close"] > rev_candle["open"] and
-              rev_candle["close"] >= prev["high"] and
-              rev_candle["open"]  <= prev["close"]):
-            reversal = "🔥 Engulfing Bullish"
-
-        # Strong Close Bullish
-        elif (rev_candle["close"] > rev_candle["open"] and
-              body >= atr * 0.3 and
-              rev_candle["close"] > sweep_level + atr * 0.1):
-            reversal = "💪 Strong Close Bullish"
-
-        if reversal:
-            print(f"[{pair}] ✅ Sweep low {round(sweep_level,4)} → {reversal}")
-            return True, sweep_level, reversal, "BUY"
         else:
-            print(f"[{pair}] Sweep ditemukan tapi reversal candle lemah")
-            return False, None, None, None
+            print(f"[{pair}] Breakout bullish ditemukan tapi tipe tidak diakui")
+            return False, None
 
-    # ── SELL setup: sweep HIGH ────────────────
-    elif structure == "DOWNTREND":
-        # Kumpulkan level liquidity atas
-        levels = []
-        if swing_highs:
-            levels += [s[1] for s in swing_highs[-3:]]
-        if eq_high:
-            levels.append(eq_high)
-        if not levels:
-            print(f"[{pair}] Tidak ada level liquidity atas")
-            return False, None, None, None
+        print(f"[{pair}] ✅ {btype} di level {round(breakout_level,4)}")
+        return True, btype
 
-        sweep_level = max(levels)
+    elif trend == "DOWNTREND":
+        if curr["close"] >= breakout_level:
+            print(f"[{pair}] Close {round(curr['close'],4)} belum tembus support {round(breakout_level,4)}")
+            return False, None
 
-        curr_swept = curr["high"] > sweep_level and curr["close"] < sweep_level
-        prev_swept = prev["high"] > sweep_level and prev["close"] < sweep_level
+        if body < atr * 0.35:
+            print(f"[{pair}] Body candle terlalu kecil untuk breakout valid")
+            return False, None
 
-        if not (curr_swept or prev_swept):
-            print(f"[{pair}] Tidak ada sweep high di {round(sweep_level, 4)}")
-            return False, None, None, None
+        if lower_wick > body * 0.8:
+            print(f"[{pair}] Lower wick besar → potensi false breakout bawah")
+            return False, None
 
-        rev_candle   = curr if curr_swept else prev
-        candle_range = rev_candle["high"] - rev_candle["low"]
-        if candle_range <= 0:
-            return False, None, None, None
+        if body >= candle_range * 0.5 and curr["close"] < breakout_level:
+            btype = "🔻 Clean Bearish Break"
 
-        body       = abs(rev_candle["close"] - rev_candle["open"])
-        lower_wick = min(rev_candle["open"], rev_candle["close"]) - rev_candle["low"]
-        upper_wick = rev_candle["high"] - max(rev_candle["open"], rev_candle["close"])
-        reversal   = None
+        elif body >= abs(prev["close"] - prev["open"]) * 1.5:
+            btype = "💥 Momentum Bearish Break"
 
-        # Pin Bar Bearish — ekor atas panjang
-        if (upper_wick >= body * 1.5 and
-                upper_wick > lower_wick and
-                rev_candle["close"] < rev_candle["high"] - candle_range * 0.5):
-            reversal = "📍 Pin Bar Bearish"
+        elif (prev["close"] < breakout_level and
+              curr["high"]  >= breakout_level * 0.999 and
+              curr["close"] < breakout_level):
+            btype = "🔄 Retest Bearish Entry"
 
-        # Engulfing Bearish
-        elif (rev_candle["close"] < rev_candle["open"] and
-              rev_candle["close"] <= prev["low"] and
-              rev_candle["open"]  >= prev["close"]):
-            reversal = "🔥 Engulfing Bearish"
-
-        # Strong Close Bearish
-        elif (rev_candle["close"] < rev_candle["open"] and
-              body >= atr * 0.3 and
-              rev_candle["close"] < sweep_level - atr * 0.1):
-            reversal = "💪 Strong Close Bearish"
-
-        if reversal:
-            print(f"[{pair}] ✅ Sweep high {round(sweep_level,4)} → {reversal}")
-            return True, sweep_level, reversal, "SELL"
         else:
-            print(f"[{pair}] Sweep ditemukan tapi reversal candle lemah")
-            return False, None, None, None
+            print(f"[{pair}] Breakout bearish ditemukan tapi tipe tidak diakui")
+            return False, None
 
-    return False, None, None, None
+        print(f"[{pair}] ✅ {btype} di level {round(breakout_level,4)}")
+        return True, btype
+
+    return False, None
 
 # ─────────────────────────────────────────────
-# KONFIRMASI 15M
+# FILTER PEMBALIKAN TREND (ANTI-REVERSAL)
 # ─────────────────────────────────────────────
-def confirm_reversal_15m(df, action):
+def detect_trend_reversal_risk(df_4h, df_1h, trend, pair=""):
     """
-    Konfirmasi momentum di 15M:
-    - Candle harus searah dengan action
+    Deteksi tanda-tanda bahwa tren sedang berbalik arah.
+    Jika ada tanda reversal → batalkan sinyal.
+
+    Tanda bahaya yang dicek:
+    1. Change of Character (CHoCH) di 4H:
+       - UPTREND : swing low terbaru ditembus ke bawah
+       - DOWNTREND: swing high terbaru ditembus ke atas
+    2. RSI Divergence di 1H:
+       - Bullish divergence di DOWNTREND = harga baru low tapi RSI naik
+       - Bearish divergence di UPTREND  = harga baru high tapi RSI turun
+    3. EMA crossover signal di 4H:
+       - EMA21 menyeberangi EMA50 berlawanan arah tren
+
+    Return: (reversal_risk: bool, reason: str)
+    """
+    # ── Cek 1: CHoCH di 4H ──────────────────────
+    if df_4h is not None and len(df_4h) >= 20:
+        swing_highs_4h, swing_lows_4h = find_swing_points(df_4h, lookback=40)
+        curr_close_4h = df_4h["close"].iloc[-1]
+
+        if trend == "UPTREND" and swing_lows_4h:
+            last_sl = swing_lows_4h[-1][1]
+            # Jika harga close menembus swing low terakhir → CHoCH bearish
+            if curr_close_4h < last_sl:
+                reason = f"⚠️ CHoCH: Harga tembus swing low 4H ({round(last_sl,4)})"
+                print(f"[{pair}] REVERSAL RISK — {reason}")
+                return True, reason
+
+        if trend == "DOWNTREND" and swing_highs_4h:
+            last_sh = swing_highs_4h[-1][1]
+            if curr_close_4h > last_sh:
+                reason = f"⚠️ CHoCH: Harga tembus swing high 4H ({round(last_sh,4)})"
+                print(f"[{pair}] REVERSAL RISK — {reason}")
+                return True, reason
+
+    # ── Cek 2: RSI Divergence di 1H ─────────────
+    if df_1h is not None and len(df_1h) >= 20:
+        rsi_series = calc_rsi(df_1h["close"], 14)
+        # Ambil 20 candle terakhir untuk deteksi divergence
+        price_tail = df_1h["close"].tail(20).values
+        rsi_tail   = rsi_series.tail(20).values
+
+        # Cari dua titik ekstrim terakhir
+        price_hi_idx = [i for i in range(1, 19) if price_tail[i] > price_tail[i-1] and price_tail[i] > price_tail[i+1]]
+        price_lo_idx = [i for i in range(1, 19) if price_tail[i] < price_tail[i-1] and price_tail[i] < price_tail[i+1]]
+
+        if trend == "UPTREND" and len(price_hi_idx) >= 2:
+            p1, p2   = price_hi_idx[-2], price_hi_idx[-1]
+            # Bearish divergence: harga higher high, RSI lower high
+            if price_tail[p2] > price_tail[p1] and rsi_tail[p2] < rsi_tail[p1] - 3:
+                reason = "⚠️ RSI Bearish Divergence di 1H"
+                print(f"[{pair}] REVERSAL RISK — {reason}")
+                return True, reason
+
+        if trend == "DOWNTREND" and len(price_lo_idx) >= 2:
+            p1, p2 = price_lo_idx[-2], price_lo_idx[-1]
+            # Bullish divergence: harga lower low, RSI higher low
+            if price_tail[p2] < price_tail[p1] and rsi_tail[p2] > rsi_tail[p1] + 3:
+                reason = "⚠️ RSI Bullish Divergence di 1H"
+                print(f"[{pair}] REVERSAL RISK — {reason}")
+                return True, reason
+
+    # ── Cek 3: EMA crossover berlawanan arah di 4H ─
+    if df_4h is not None and len(df_4h) >= 50:
+        ema21 = calc_ema(df_4h["close"], 21)
+        ema50 = calc_ema(df_4h["close"], 50)
+        e21_now  = ema21.iloc[-1]
+        e50_now  = ema50.iloc[-1]
+        e21_prev = ema21.iloc[-2]
+        e50_prev = ema50.iloc[-2]
+
+        # EMA21 cross below EMA50 di UPTREND → sinyal pelemahan
+        if trend == "UPTREND" and e21_prev >= e50_prev and e21_now < e50_now:
+            reason = "⚠️ EMA21 cross bawah EMA50 di 4H (tren melemah)"
+            print(f"[{pair}] REVERSAL RISK — {reason}")
+            return True, reason
+
+        # EMA21 cross above EMA50 di DOWNTREND → sinyal pelemahan bearish
+        if trend == "DOWNTREND" and e21_prev <= e50_prev and e21_now > e50_now:
+            reason = "⚠️ EMA21 cross atas EMA50 di 4H (tren melemah)"
+            print(f"[{pair}] REVERSAL RISK — {reason}")
+            return True, reason
+
+    return False, ""
+
+# ─────────────────────────────────────────────
+# KONFIRMASI MOMENTUM 15M
+# ─────────────────────────────────────────────
+def confirm_breakout_15m(df, action, pair=""):
+    """
+    Konfirmasi momentum di 15M setelah breakout 1H:
+    - Candle searah action
     - Close melewati high/low candle sebelumnya
-    - Body minimal 30% ATR (tidak terlalu lemah)
+    - RSI mendukung arah (tidak overbought/oversold ekstrem)
+    - Body minimal 25% ATR
     """
-    if len(df) < 3:
+    if len(df) < 5:
         return False
+
     curr = df.iloc[-2]
     prev = df.iloc[-3]
-    atr  = (df["high"] - df["low"]).tail(14).mean()
+    atr  = calc_adr(df, 14)
     body = abs(curr["close"] - curr["open"])
+    rsi  = calc_rsi(df["close"], 14).iloc[-2]
 
-    if body < atr * 0.1:
+    if body < atr * 0.25:
+        print(f"[{pair}] 15M body lemah")
         return False
 
     if action == "BUY":
+        # RSI tidak boleh overbought ekstrem (>80) → kemungkinan pullback segera
+        if rsi > 80:
+            print(f"[{pair}] 15M RSI overbought ({round(rsi,1)}) → skip")
+            return False
         return (curr["close"] > curr["open"] and
                 curr["close"] > prev["high"])
+
     elif action == "SELL":
+        if rsi < 20:
+            print(f"[{pair}] 15M RSI oversold ({round(rsi,1)}) → skip")
+            return False
         return (curr["close"] < curr["open"] and
                 curr["close"] < prev["low"])
+
     return False
 
 # ─────────────────────────────────────────────
 # HITUNG SL / TP
 # ─────────────────────────────────────────────
-def calc_sl_tp(df, action, sweep_level):
+def calc_sl_tp(df, action, breakout_level):
     """
-    SL: di balik sweep level + ATR buffer
-    TP: RR 1:3
+    Entry : close terbaru (15M)
+    SL    : di balik breakout_level + ATR buffer
+            (jika harga kembali ke bawah/atas level → breakout gagal)
+    TP    : RR 1:2.5 (lebih konservatif untuk trend following)
     """
     price  = df["close"].iloc[-2]
-    atr    = (df["high"] - df["low"]).tail(14).mean()
-    buffer = atr * 0.3
+    atr    = calc_adr(df, 14)
+    buffer = atr * 0.25
 
     if action == "BUY":
-        sl   = round(sweep_level - buffer, 4)
+        sl   = round(breakout_level - buffer, 4)
         risk = price - sl
-        if risk <= 0 or risk > atr * 4:
+        if risk <= 0 or risk > atr * 5:
             return None, None, None, None
-        tp = round(price + risk * 3, 4)
+        tp = round(price + risk * 2.5, 4)
 
     elif action == "SELL":
-        sl   = round(sweep_level + buffer, 4)
+        sl   = round(breakout_level + buffer, 4)
         risk = sl - price
-        if risk <= 0 or risk > atr * 4:
+        if risk <= 0 or risk > atr * 5:
             return None, None, None, None
-        tp = round(price - risk * 3, 4)
+        tp = round(price - risk * 2.5, 4)
 
     else:
         return None, None, None, None
@@ -471,7 +602,7 @@ def format_fred_data(fred_data):
 # ─────────────────────────────────────────────
 # GROQ AI ANALYSIS
 # ─────────────────────────────────────────────
-def analyze_with_groq(pair, structure, action, reversal_type, headlines, fred_data):
+def analyze_with_groq(pair, trend_1d, trend_4h, action, breakout_type, headlines, fred_data):
     if not GROQ_API_KEY:
         return "Analisis AI tidak tersedia."
     try:
@@ -489,10 +620,11 @@ Data Ekonomi Makro Terkini:
 
         prompt = f"""Kamu adalah analis trading forex dan ekonomi makro profesional.
 
-Pair    : {pair}
-Sinyal  : {action}
-Struktur: {structure}
-Pola    : {reversal_type} setelah liquidity sweep
+Pair      : {pair}
+Sinyal    : {action}
+Tren 1D   : {trend_1d}
+Tren 4H   : {trend_4h}
+Breakout  : {breakout_type}
 
 {fred_text}
 
@@ -502,8 +634,8 @@ Berita Terkini:
 Tugas:
 1. Apakah kondisi makro mendukung sinyal {action} pada {pair}?
 2. Dampak data Fed Rate, CPI, NFP terhadap {pair}?
-3. Fundamental SEJALAN atau BERLAWANAN dengan sinyal teknikal?
-4. Prediksi arah harga berdasarkan fundamental.
+3. Apakah tren jangka panjang 1D & 4H SEJALAN atau ada risiko pembalikan?
+4. Prediksi kelanjutan tren berdasarkan fundamental.
 
 Jawab Bahasa Indonesia, maksimal 5 kalimat, langsung ke poin."""
 
@@ -528,6 +660,84 @@ Jawab Bahasa Indonesia, maksimal 5 kalimat, langsung ke poin."""
         return "Analisis AI tidak tersedia saat ini."
 
 # ─────────────────────────────────────────────
+# ANALISIS PER PAIR
+# ─────────────────────────────────────────────
+def analyze_pair(pair, symbol):
+    print(f"\n[{pair}] Menganalisis...")
+
+    df_1d  = get_data(symbol, "1d",  "120d")
+    df_4h  = get_data(symbol, "4h",  "60d")
+    df_1h  = get_data(symbol, "1h",  "7d")
+    df_15m = get_data(symbol, "15m", "2d")
+
+    if df_1d is None or df_4h is None or df_1h is None or df_15m is None:
+        print(f"[{pair}] Data tidak tersedia")
+        return None
+
+    # ── Step 1: Deteksi tren 1D & 4H ──────────
+    trend_1d = detect_trend(df_1d, label=f"{pair} 1D")
+    trend_4h = detect_trend(df_4h, label=f"{pair} 4H")
+
+    # Kedua timeframe harus searah — jika tidak, skip
+    if trend_1d == "SIDEWAYS" or trend_4h == "SIDEWAYS":
+        print(f"[{pair}] Salah satu TF SIDEWAYS → NO TRADE")
+        return None
+
+    if trend_1d != trend_4h:
+        print(f"[{pair}] Tren 1D ({trend_1d}) ≠ 4H ({trend_4h}) → konflik → NO TRADE")
+        return None
+
+    trend  = trend_1d
+    action = "BUY" if trend == "UPTREND" else "SELL"
+
+    # ── Step 2: Cek risiko pembalikan tren ────
+    reversal_risk, reversal_reason = detect_trend_reversal_risk(
+        df_4h, df_1h, trend, pair=pair
+    )
+    if reversal_risk:
+        print(f"[{pair}] Ada tanda pembalikan → batalkan sinyal")
+        return None
+
+    # ── Step 3: Cari level breakout di 1H ─────
+    breakout_level = find_breakout_level(df_1h, trend, lookback=30)
+    if breakout_level is None:
+        print(f"[{pair}] Tidak ada level breakout yang valid")
+        return None
+
+    print(f"[{pair}] Level breakout {trend}: {round(breakout_level,4)}")
+
+    # ── Step 4: Konfirmasi breakout di 1H ─────
+    broke, breakout_type = detect_breakout(df_1h, trend, breakout_level, pair=pair)
+    if not broke:
+        return None
+
+    # ── Step 5: Konfirmasi momentum di 15M ────
+    confirmed = confirm_breakout_15m(df_15m, action, pair=pair)
+    if not confirmed:
+        print(f"[{pair}] Momentum 15M belum konfirmasi")
+        return None
+
+    # ── Step 6: Hitung SL / TP ────────────────
+    entry, sl, tp, rr = calc_sl_tp(df_15m, action, breakout_level)
+    if entry is None:
+        print(f"[{pair}] Risk kalkulasi invalid, skip")
+        return None
+
+    print(f"[{pair}] ✅ SINYAL {action} | Entry:{entry} SL:{sl} TP:{tp} RR:1:{rr}")
+    return {
+        "pair"          : pair,
+        "action"        : action,
+        "entry"         : entry,
+        "sl"            : sl,
+        "tp"            : tp,
+        "rr"            : rr,
+        "trend_1d"      : trend_1d,
+        "trend_4h"      : trend_4h,
+        "breakout_level": breakout_level,
+        "breakout_type" : breakout_type,
+    }
+
+# ─────────────────────────────────────────────
 # TELEGRAM
 # ─────────────────────────────────────────────
 def send_telegram(message):
@@ -545,69 +755,11 @@ def send_telegram(message):
         print(f"[TELEGRAM] ❌ {e}")
 
 # ─────────────────────────────────────────────
-# ANALISIS PER PAIR
-# ─────────────────────────────────────────────
-def analyze_pair(pair, symbol):
-    print(f"\n[{pair}] Menganalisis...")
-
-    df_4h  = get_data(symbol, "4h",  "60d")
-    df_1h  = get_data(symbol, "1h",  "7d")
-    df_15m = get_data(symbol, "15m", "2d")
-
-    if df_4h is None or df_1h is None or df_15m is None:
-        print(f"[{pair}] Data tidak tersedia")
-        return None
-
-    structure_4h = detect_structure(df_4h)
-    structure_1h = detect_structure(df_1h)
-
-    print(f"[{pair}] Struktur 4H: {structure_4h} | 1H: {structure_1h}")
-
-    if structure_4h == "SIDEWAYS":
-        print(f"[{pair}] 4H SIDEWAYS → NO TRADE")
-        return None
-
-    structure = structure_4h
-
-    # Step 1: Cari sweep + reversal candle di 1H
-    swept, sweep_level, reversal_type, action = detect_sweep_reversal(
-        df_1h, structure, pair=pair
-    )
-    if not swept:
-        return None
-
-    # Step 2: Konfirmasi momentum di 15M
-    confirmed = confirm_reversal_15m(df_15m, action)
-    if not confirmed:
-        print(f"[{pair}] Reversal belum terkonfirmasi di 15M")
-        return None
-
-    # Step 3: Hitung SL / TP
-    entry, sl, tp, rr = calc_sl_tp(df_15m, action, sweep_level)
-    if entry is None:
-        print(f"[{pair}] Risk kalkulasi invalid, skip")
-        return None
-
-    print(f"[{pair}] ✅ SINYAL {action} | Entry:{entry} SL:{sl} TP:{tp} RR:1:{rr}")
-    return {
-        "pair"         : pair,
-        "action"       : action,
-        "entry"        : entry,
-        "sl"           : sl,
-        "tp"           : tp,
-        "rr"           : rr,
-        "structure"    : structure,
-        "structure_1h" : structure_1h,
-        "sweep_level"  : sweep_level,
-        "reversal_type": reversal_type,
-    }
-
-# ─────────────────────────────────────────────
 # MAIN LOOP
 # ─────────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("  SMC Liquidity Sweep Reversal Bot  v1.0")
+    print("  Trend Following Breakout Bot  v1.0")
     print(f"  Pairs   : {len(PAIRS)} pairs aktif")
     print(f"  Interval: {CHECK_INTERVAL}s")
     print(f"  Max sinyal/cycle: {MAX_SIGNALS_PER_CYCLE}")
@@ -618,11 +770,12 @@ def main():
         return
 
     send_telegram(
-        "🤖 <b>SMC Liquidity Sweep Reversal Bot v1.0 — ONLINE!</b>\n"
+        "🤖 <b>Trend Following Breakout Bot v1.0 — ONLINE!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Pairs      : {len(PAIRS)} pair aktif\n"
-        "📈 Strategy   : Liquidity Sweep Reversal\n"
-        "🕯️ Timeframe  : 4H Trend → 1H Sweep → 15M Konfirmasi\n"
+        "📈 Strategy   : Trend Following + Breakout Entry\n"
+        "🕯️ Timeframe  : 1D Trend → 4H Konfirmasi → 1H Breakout → 15M Entry\n"
+        "🛡️ Anti-Rev   : CHoCH + RSI Divergence + EMA Cross Filter\n"
         "🧠 AI         : Groq Llama3 (Makro Ekonomi)\n"
         "📰 News       : NewsAPI\n"
         "📊 Ekonomi    : FRED API\n"
@@ -665,8 +818,8 @@ def main():
                 if result is None:
                     continue
 
-                # Anti-spam: pakai sweep_level sebagai identitas setup
-                sig_key   = f"{pair}_{result['action']}_{result['sweep_level']}"
+                # Anti-spam: pakai breakout_level sebagai identitas setup
+                sig_key   = f"{pair}_{result['action']}_{result['breakout_level']}"
                 now_ts    = time.time()
                 last_key  = sent_signals.get(pair)
                 last_time = sent_signals_time.get(pair, 0)
@@ -681,12 +834,17 @@ def main():
 
                 headlines   = get_news(pair)
                 ai_analysis = analyze_with_groq(
-                    pair, result["structure"], result["action"],
-                    result["reversal_type"], headlines, fred_data
+                    pair,
+                    result["trend_1d"],
+                    result["trend_4h"],
+                    result["action"],
+                    result["breakout_type"],
+                    headlines,
+                    fred_data
                 )
 
                 emj       = "🟢" if result["action"] == "BUY" else "🔴"
-                trend_emj = "📈" if result["structure"] == "UPTREND" else "📉"
+                trend_emj = "📈" if result["trend_1d"] == "UPTREND" else "📉"
                 news_text = "\n".join(
                     [f"   • {h[:55]}..." for h in headlines]
                 ) if headlines else "   • Tidak tersedia"
@@ -695,16 +853,16 @@ def main():
                 msg = (
                     f"{emj} <b>SINYAL {result['action']} — {pair}</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏱️ Waktu         : {now_str}\n"
-                    f"💰 Entry         : {result['entry']}\n"
-                    f"🛑 Stop Loss     : {result['sl']}\n"
-                    f"🎯 Take Profit   : {result['tp']}\n"
-                    f"⚖️ R:R Ratio     : 1:{result['rr']}\n"
+                    f"⏱️ Waktu          : {now_str}\n"
+                    f"💰 Entry          : {result['entry']}\n"
+                    f"🛑 Stop Loss      : {result['sl']}\n"
+                    f"🎯 Take Profit    : {result['tp']}\n"
+                    f"⚖️ R:R Ratio      : 1:{result['rr']}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"{trend_emj} <b>Struktur 4H :</b> {result['structure']}\n"
-                    f"📊 <b>Struktur 1H :</b> {result['structure_1h']}\n"
-                    f"💧 Sweep Level   : {result['sweep_level']}\n"
-                    f"🕯️ Pola Reversal : {result['reversal_type']}\n"
+                    f"{trend_emj} <b>Tren 1D  :</b> {result['trend_1d']}\n"
+                    f"📊 <b>Tren 4H  :</b> {result['trend_4h']}\n"
+                    f"🔑 Break Level    : {result['breakout_level']}\n"
+                    f"💥 Tipe Breakout  : {result['breakout_type']}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"📊 <b>Data Ekonomi Makro:</b>\n{fred_text}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -712,7 +870,7 @@ def main():
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
                     f"🧠 <b>Analisis AI Makro:</b>\n{ai_analysis}\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"✅ <b>SETUP SWEEP REVERSAL TERKONFIRMASI!</b>\n"
+                    f"✅ <b>BREAKOUT TREND TERKONFIRMASI!</b>\n"
                     f"⚠️ Risiko maks 1-2% per trade!"
                 )
                 send_telegram(msg)

@@ -1,14 +1,21 @@
 """
 =======================================================
-  Binance Whale Accumulation Detector
-  Exchange : KuCoin (Public API, no key needed)
-  Deteksi  : Akumulasi whale tahap awal
-  Sinyal   :
+  Binance Whale Accumulation & Distribution Detector
+  Exchange : Binance (Public API, no key needed)
+  Deteksi  : Akumulasi (BELI) & Distribusi (JUAL)
+  Sinyal Beli  :
     1. Volume spike abnormal
     2. Ask wall tiba-tiba hilang
-    3. Trade besar beruntun
+    3. Trade beli besar beruntun
     4. Bid wall besar muncul
     5. Spread ketat
+    6. Harga naik signifikan
+  Sinyal Jual  :
+    1. Bid wall hilang tiba-tiba (pembeli mundur)
+    2. Ask wall besar muncul (penjual masuk)
+    3. Transaksi jual besar beruntun
+    4. Volume spike tapi harga turun (distribusi)
+    5. Harga turun dari high 24H signifikan
   Notif    : Telegram
 =======================================================
 """
@@ -29,15 +36,17 @@ MIN_VOLUME_USDT         = 100_000  # min volume 100k USDT/hari
 WALL_USDT_THRESHOLD     = 50_000   # wall besar jika > 50k USDT
 BIG_TRADE_USDT          = 10_000   # transaksi besar jika > 10k USDT
 BIG_TRADE_COUNT         = 3        # minimal 3 transaksi besar
-SCORE_MIN               = 4        # minimal score 2 untuk alert
+SCORE_MIN               = 2        # minimal score 2 untuk alert
 
 # ── Penyimpanan histori ───────────────────────────────
 volume_history   = defaultdict(list)
 ask_wall_history = defaultdict(list)
+bid_wall_history = defaultdict(list)
+price_history    = defaultdict(list)
 sent_cache       = {}
+sell_sent_cache  = {}
 
-BASE_URL = "https://api.kucoin.com"
-BLACKLIST = {"USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDD", "USD1"}
+BASE_URL = "https://api.binance.com"
 
 # ── Telegram ──────────────────────────────────────────
 def send_telegram(msg):
@@ -61,30 +70,25 @@ def send_telegram(msg):
 # ── Test koneksi ──────────────────────────────────────
 def test_connection():
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/timestamp", timeout=10)
-        data = r.json()
-        if r.status_code == 200 and data.get("code") == "200000":
-            print(f"[TEST] KuCoin API: OK (status {r.status_code})")
-            return True
-        else:
-            print(f"[TEST] KuCoin API: GAGAL (status {r.status_code}, code {data.get('code')})")
-            return False
+        r = requests.get(f"{BASE_URL}/api/v3/ping", timeout=10)
+        print(f"[TEST] Binance API: OK (status {r.status_code})")
+        return True
     except Exception as e:
-        print(f"[TEST] GAGAL akses KuCoin: {e}")
+        print(f"[TEST] GAGAL akses Binance: {e}")
         return False
 
 # ── Ambil semua pair USDT ─────────────────────────────
 def get_all_pairs():
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/symbols", timeout=15)
+        r = requests.get(f"{BASE_URL}/api/v3/exchangeInfo", timeout=15)
         data = r.json()
         pairs = []
-        for s in data.get("data", []):
-            if (s["quoteCurrency"] == "USDT" and
-                s["enableTrading"] and
-                s["baseCurrency"] not in BLACKLIST):
-                pairs.append(s["symbol"])  # format: BTC-USDT
-        print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di KuCoin")
+        for s in data.get("symbols", []):
+            if (s["quoteAsset"] == "USDT" and
+                s["status"] == "TRADING" and
+                s["isSpotTradingAllowed"]):
+                pairs.append(s["symbol"])
+        print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di Binance")
         return pairs
     except Exception as e:
         print(f"[PAIRS ERROR] {e}")
@@ -93,22 +97,15 @@ def get_all_pairs():
 # ── Ambil ticker 24h ──────────────────────────────────
 def get_ticker(symbol):
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/market/stats",
+        r = requests.get(f"{BASE_URL}/api/v3/ticker/24hr",
                          params={"symbol": symbol}, timeout=8)
-        d = r.json().get("data", {})
-        if not d:
-            return None
-        last = float(d.get("last", 0) or 0)
-        vol  = float(d.get("volValue", 0) or 0)  # sudah dalam USDT
-        high = float(d.get("high", 0) or 0)
-        low  = float(d.get("low", 0) or 0)
-        chg  = float(d.get("changeRate", 0) or 0) * 100
+        d = r.json()
         return {
-            "last"      : last,
-            "vol_usdt"  : vol,
-            "high"      : high,
-            "low"       : low,
-            "price_chg" : chg,
+            "last"      : float(d.get("lastPrice", 0)),
+            "vol_usdt"  : float(d.get("quoteVolume", 0)),
+            "high"      : float(d.get("highPrice", 0)),
+            "low"       : float(d.get("lowPrice", 0)),
+            "price_chg" : float(d.get("priceChangePercent", 0)),
         }
     except:
         return None
@@ -116,11 +113,9 @@ def get_ticker(symbol):
 # ── Ambil order book ──────────────────────────────────
 def get_order_book(symbol, limit=20):
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level2_20",
-                         params={"symbol": symbol}, timeout=8)
-        data = r.json().get("data", {})
-        if not data:
-            return [], []
+        r = requests.get(f"{BASE_URL}/api/v3/depth",
+                         params={"symbol": symbol, "limit": limit}, timeout=8)
+        data = r.json()
         bids = [[float(x[0]), float(x[1])] for x in data.get("bids", [])]
         asks = [[float(x[0]), float(x[1])] for x in data.get("asks", [])]
         return bids, asks
@@ -130,14 +125,14 @@ def get_order_book(symbol, limit=20):
 # ── Ambil trade history ───────────────────────────────
 def get_recent_trades(symbol, limit=50):
     try:
-        r = requests.get(f"{BASE_URL}/api/v1/market/histories",
-                         params={"symbol": symbol}, timeout=8)
-        trades = r.json().get("data", [])
+        r = requests.get(f"{BASE_URL}/api/v3/trades",
+                         params={"symbol": symbol, "limit": limit}, timeout=8)
+        trades = r.json()
         result = []
         for t in trades:
             price  = float(t.get("price", 0))
-            qty    = float(t.get("size", 0))
-            is_buy = t.get("side") == "buy"
+            qty    = float(t.get("qty", 0))
+            is_buy = not t.get("isBuyerMaker", True)
             result.append({
                 "type" : "buy" if is_buy else "sell",
                 "price": price,
@@ -223,11 +218,135 @@ def detect_whale_signals(symbol, ticker, bids, asks, trades):
 
     return score, signals
 
+# ── Deteksi sinyal distribusi (JUAL) ─────────────────
+def detect_distribution_signals(symbol, ticker, bids, asks, trades):
+    signals  = []
+    score    = 0
+    vol_usdt   = ticker["vol_usdt"]
+    last_price = ticker["last"]
+
+    # ── Cek sinyal 2: Ask Wall Besar Muncul ───────────
+    has_ask_wall = False
+    total_ask = sum(p * q for p, q in asks[:15])
+    ask_hist  = ask_wall_history[symbol]
+    if len(ask_hist) >= 3:
+        prev_ask_avg = sum(ask_hist[:-1]) / len(ask_hist[:-1])
+        if prev_ask_avg > 0:
+            ask_ratio = total_ask / prev_ask_avg
+            if ask_ratio > 2.5:
+                has_ask_wall = True
+                signals.append(f"🧱 Ask wall meledak <b>{round(ask_ratio,1)}x</b> — penjual masuk besar!")
+                score += 2
+            elif ask_ratio > 1.7:
+                has_ask_wall = True
+                signals.append(f"📦 Ask wall naik <b>{round(ask_ratio,1)}x</b> — penjual mulai masuk")
+                score += 1
+
+    # ── Cek sinyal 3: Transaksi Jual Besar Beruntun ───
+    has_big_sells = False
+    big_sells = [t for t in trades if t["type"] == "sell" and t["usdt"] >= BIG_TRADE_USDT]
+    if len(big_sells) >= BIG_TRADE_COUNT:
+        has_big_sells = True
+        total_big_sell = sum(t["usdt"] for t in big_sells)
+        signals.append(f"🐳 <b>{len(big_sells)} transaksi jual besar</b> total ${int(total_big_sell):,}")
+        score += 2
+
+    # ── Wajib: sinyal 2 DAN 3 harus aktif bersamaan ──
+    if not (has_ask_wall and has_big_sells):
+        return 0, []
+
+    # ── 1. Bid Wall Hilang (pembeli mundur) ───────────
+    total_bid = sum(p * q for p, q in bids[:15])
+    bid_hist  = bid_wall_history[symbol]
+    bid_hist.append(total_bid)
+    if len(bid_hist) > 10:
+        bid_hist.pop(0)
+
+    if len(bid_hist) >= 3:
+        prev_bid_avg = sum(bid_hist[:-1]) / len(bid_hist[:-1])
+        if prev_bid_avg > 0:
+            bid_ratio = total_bid / prev_bid_avg
+            if bid_ratio < 0.4:
+                signals.append(f"🚨 Bid wall hilang <b>{round((1-bid_ratio)*100)}%</b> — pembeli mundur!")
+                score += 2
+            elif bid_ratio < 0.6:
+                signals.append(f"⚠️ Bid wall menipis <b>{round((1-bid_ratio)*100)}%</b>")
+                score += 1
+
+    # ── 4. Volume Spike tapi Harga Turun (distribusi) ─
+    hist = volume_history[symbol]
+    if len(hist) >= 5:
+        avg_vol = sum(hist[:-1]) / len(hist[:-1])
+        if avg_vol > 0:
+            vol_ratio = vol_usdt / avg_vol
+            chg = ticker["price_chg"]
+            if vol_ratio >= 2.0 and chg <= -3:
+                signals.append(f"💀 Volume spike <b>{round(vol_ratio,1)}x</b> tapi harga turun <b>{round(chg,1)}%</b> — DISTRIBUSI!")
+                score += 3
+            elif vol_ratio >= 1.5 and chg <= -2:
+                signals.append(f"⚠️ Volume tinggi tapi harga melemah <b>{round(chg,1)}%</b>")
+                score += 1
+
+    # ── 5. Harga Turun dari High 24H ──────────────────
+    high_24h = ticker["high"]
+    if high_24h > 0:
+        drop_from_high = (high_24h - last_price) / high_24h * 100
+        if drop_from_high >= 10:
+            signals.append(f"📉 Harga turun <b>{round(drop_from_high,1)}%</b> dari high 24H (${high_24h})")
+            score += 2
+        elif drop_from_high >= 5:
+            signals.append(f"⚠️ Harga turun <b>{round(drop_from_high,1)}%</b> dari high 24H")
+            score += 1
+
+    return score, signals
+
+# ── Format pesan JUAL ─────────────────────────────────
+def format_sell_alert(symbol, ticker, score, signals, bids, asks):
+    now_str    = datetime.now().strftime("%H:%M:%S")
+    last_price = ticker["last"]
+    coin       = symbol.replace("USDT", "")
+
+    support    = bids[0][0] if bids else "-"
+    resistance = asks[0][0] if asks else "-"
+
+    signal_text = "\n".join([f"   {s}" for s in signals])
+
+    if score >= 5:
+        alert_level = "🔴 DISTRIBUSI KUAT — SEGERA JUAL!"
+        emoji = "🔴"
+    elif score >= 3:
+        alert_level = "🟠 DISTRIBUSI TERDETEKSI — PERTIMBANGKAN JUAL"
+        emoji = "🟠"
+    else:
+        alert_level = "🟡 MULAI MELEMAH — WASPADA"
+        emoji = "🟡"
+
+    msg = (
+        f"{emoji} <b>SELL SIGNAL — {coin}/USDT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱️ Waktu       : {now_str}\n"
+        f"💰 Harga       : ${last_price}\n"
+        f"📈 High 24H    : ${ticker['high']}\n"
+        f"📉 Low 24H     : ${ticker['low']}\n"
+        f"📊 Perubahan   : {ticker['price_chg']}%\n"
+        f"💹 Volume 24H  : ${int(ticker['vol_usdt']):,}\n"
+        f"🛡️ Support     : ${support}\n"
+        f"🚧 Resistance  : ${resistance}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>Score: {score} | {alert_level}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Sinyal terdeteksi:</b>\n{signal_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ Bukan jaminan turun, tetap gunakan analisis sendiri!\n"
+        f"💡 Selalu gunakan risk management!"
+    )
+    return msg
+
 # ── Format pesan alert ────────────────────────────────
 def format_alert(symbol, ticker, score, signals, bids, asks):
     now_str    = datetime.now().strftime("%H:%M:%S")
     last_price = ticker["last"]
-    coin       = symbol.replace("-USDT", "")
+    coin       = symbol.replace("USDT", "")
 
     support    = bids[0][0] if bids else "-"
     resistance = asks[0][0] if asks else "-"
@@ -251,7 +370,7 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
         f"💰 Harga       : ${last_price}\n"
         f"📈 High 24H    : ${ticker['high']}\n"
         f"📉 Low 24H     : ${ticker['low']}\n"
-        f"📊 Perubahan   : {round(ticker['price_chg'], 2)}%\n"
+        f"📊 Perubahan   : {ticker['price_chg']}%\n"
         f"💹 Volume 24H  : ${int(ticker['vol_usdt']):,}\n"
         f"🛡️ Support     : ${support}\n"
         f"🚧 Resistance  : ${resistance}\n"
@@ -269,7 +388,6 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
 def main():
     print("=" * 55)
     print("  Binance Whale Accumulation Detector")
-    print(f"  Exchange  : KuCoin")
     print(f"  Interval  : {CHECK_INTERVAL}s")
     print(f"  Min Volume: ${MIN_VOLUME_USDT:,} USDT")
     print(f"  Min Score : {SCORE_MIN}")
@@ -279,22 +397,28 @@ def main():
         print("[ERROR] BOT_TOKEN / CHAT_ID belum diset!")
         return
 
-    print("[TEST] Mencoba akses KuCoin API...")
+    print("[TEST] Mencoba akses Binance API...")
     if not test_connection():
-        print("[ERROR] Tidak bisa akses KuCoin, cek koneksi!")
+        print("[ERROR] Tidak bisa akses Binance, cek koneksi!")
         return
 
     send_telegram(
-        "🐋 <b>Whale Detector KuCoin — ONLINE!</b>\n"
+        "🐋 <b>Whale Detector Binance — ONLINE!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 Exchange  : KuCoin\n"
-        "🔍 Deteksi   :\n"
+        "📊 Exchange  : Binance\n"
+        "🟢 Sinyal BELI:\n"
         "   🔥 Volume spike abnormal\n"
         "   🚪 Ask wall tiba-tiba hilang\n"
         "   💚 Bid wall besar muncul\n"
         "   🐋 Transaksi beli besar beruntun\n"
         "   ⚡ Spread ketat\n"
         "   🚀 Harga naik signifikan\n"
+        "🔴 Sinyal JUAL:\n"
+        "   🚨 Bid wall hilang (pembeli mundur)\n"
+        "   🧱 Ask wall meledak (penjual masuk)\n"
+        "   🐳 Transaksi jual besar beruntun\n"
+        "   💀 Volume spike + harga turun\n"
+        "   📉 Harga turun dari high 24H\n"
         f"⏱️ Interval  : setiap {CHECK_INTERVAL//60} menit\n"
         f"💰 Min Volume: ${MIN_VOLUME_USDT:,} USDT/hari\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -310,9 +434,11 @@ def main():
             ticker = get_ticker(symbol)
             if ticker and ticker["vol_usdt"] >= MIN_VOLUME_USDT:
                 volume_history[symbol].append(ticker["vol_usdt"])
-                _, asks = get_order_book(symbol)
+                bids, asks = get_order_book(symbol)
                 total_ask = sum(p*q for p,q in asks[:15]) if asks else 0
+                total_bid = sum(p*q for p,q in bids[:15]) if bids else 0
                 ask_wall_history[symbol].append(total_ask)
+                bid_wall_history[symbol].append(total_bid)
                 count += 1
         except:
             continue
@@ -321,7 +447,7 @@ def main():
 
     while True:
         now_str = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{now_str}] Scanning semua pair KuCoin...")
+        print(f"\n[{now_str}] Scanning semua pair Binance...")
 
         pairs = get_all_pairs()
         if not pairs:
@@ -344,24 +470,39 @@ def main():
                 score, signals = detect_whale_signals(symbol, ticker, bids, asks, trades)
 
                 if score > 0:
-                    print(f"[{symbol}] Score: {score} | {len(signals)} sinyal")
+                    print(f"[{symbol}] BUY Score: {score} | {len(signals)} sinyal")
 
-                if score < SCORE_MIN:
-                    continue
+                if score >= SCORE_MIN:
+                    # Cooldown 30 menit per coin (beli)
+                    last_sent = sent_cache.get(symbol, 0)
+                    if time.time() - last_sent >= 1800:
+                        msg = format_alert(symbol, ticker, score, signals, bids, asks)
+                        send_telegram(msg)
+                        sent_cache[symbol] = time.time()
+                        alerts_sent += 1
+                        print(f"[{symbol}] ✅ BUY Alert dikirim! Score: {score}")
+                        time.sleep(0.5)
+                    else:
+                        print(f"[{symbol}] Cooldown BUY aktif, skip")
 
-                # Cooldown 30 menit per coin
-                last_sent = sent_cache.get(symbol, 0)
-                if time.time() - last_sent < 1800:
-                    print(f"[{symbol}] Cooldown aktif, skip")
-                    continue
+                # ── Cek sinyal JUAL ───────────────────
+                sell_score, sell_signals = detect_distribution_signals(symbol, ticker, bids, asks, trades)
 
-                msg = format_alert(symbol, ticker, score, signals, bids, asks)
-                send_telegram(msg)
-                sent_cache[symbol] = time.time()
-                alerts_sent += 1
-                print(f"[{symbol}] ✅ Alert dikirim! Score: {score}")
+                if sell_score > 0:
+                    print(f"[{symbol}] SELL Score: {sell_score} | {len(sell_signals)} sinyal")
 
-                time.sleep(0.5)
+                if sell_score >= SCORE_MIN:
+                    # Cooldown 30 menit per coin (jual)
+                    last_sell_sent = sell_sent_cache.get(symbol, 0)
+                    if time.time() - last_sell_sent >= 1800:
+                        sell_msg = format_sell_alert(symbol, ticker, sell_score, sell_signals, bids, asks)
+                        send_telegram(sell_msg)
+                        sell_sent_cache[symbol] = time.time()
+                        alerts_sent += 1
+                        print(f"[{symbol}] 🔴 SELL Alert dikirim! Score: {sell_score}")
+                        time.sleep(0.5)
+                    else:
+                        print(f"[{symbol}] Cooldown SELL aktif, skip")
 
             except Exception as e:
                 print(f"[ERROR] {symbol}: {e}")
@@ -372,4 +513,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-      

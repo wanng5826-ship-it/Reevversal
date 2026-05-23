@@ -24,11 +24,11 @@ CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "120"))  # 2 menit
 
 # ── Threshold deteksi ─────────────────────────────────
 VOLUME_SPIKE_MULTIPLIER = 3.0    # volume sekarang > 3x rata-rata → spike
-MIN_VOLUME_IDR          = 10_000_000   # min volume 10 juta IDR (termasuk koin kecil)
-WALL_IDR_THRESHOLD      = 3_000_000   # wall dianggap besar jika > 3 juta IDR
-BIG_TRADE_IDR           = 1_000_000   # transaksi dianggap besar jika > 1 juta IDR
+MIN_VOLUME_IDR          = 1_000_000   # min volume 10 juta IDR (termasuk koin kecil)
+WALL_IDR_THRESHOLD      = 500_000   # wall dianggap besar jika > 3 juta IDR
+BIG_TRADE_IDR           = 200_000   # transaksi dianggap besar jika > 1 juta IDR
 BIG_TRADE_COUNT         = 3           # minimal 3 transaksi besar dalam 1 siklus
-SCORE_MIN               = 2           # minimal 2 sinyal terpenuhi untuk alert
+SCORE_MIN               = 1           # minimal 2 sinyal terpenuhi untuk alert
 
 # ── Penyimpanan histori ───────────────────────────────
 volume_history  = defaultdict(list)   # histori volume per coin
@@ -334,3 +334,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+      

@@ -1,1 +1,1 @@
-worker: python lsr_bot.py
+worker: python whale_detector.py

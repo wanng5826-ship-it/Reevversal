@@ -37,7 +37,7 @@ ask_wall_history = defaultdict(list)
 sent_cache       = {}
 
 BASE_URL = "https://api.kucoin.com"
-BLACKLIST = {"USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDD"}
+BLACKLIST = {"USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDD", "USD1"}
 
 # ── Telegram ──────────────────────────────────────────
 def send_telegram(msg):

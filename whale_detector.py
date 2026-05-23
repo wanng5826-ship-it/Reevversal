@@ -72,6 +72,18 @@ def get_all_pairs():
         print(f"[PAIRS ERROR] {e}")
         return []
 
+def test_connection():
+    """Test apakah Indodax bisa diakses"""
+    try:
+        r = requests.get("https://indodax.com/api/pairs", timeout=10)
+        print(f"[TEST] Status: {r.status_code} | Size: {len(r.text)} bytes")
+        data = r.json()
+        print(f"[TEST] Berhasil ambil {len(data)} pair dari Indodax")
+        return True
+    except Exception as e:
+        print(f"[TEST] GAGAL akses Indodax: {e}")
+        return False
+
 # ── Ambil ticker ──────────────────────────────────────
 def get_ticker(ticker_id):
     try:

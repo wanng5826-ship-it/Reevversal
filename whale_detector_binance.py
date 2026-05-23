@@ -29,7 +29,7 @@ MIN_VOLUME_USDT         = 100_000  # min volume 100k USDT/hari
 WALL_USDT_THRESHOLD     = 50_000   # wall besar jika > 50k USDT
 BIG_TRADE_USDT          = 10_000   # transaksi besar jika > 10k USDT
 BIG_TRADE_COUNT         = 3        # minimal 3 transaksi besar
-SCORE_MIN               = 2        # minimal score 2 untuk alert
+SCORE_MIN               = 4        # minimal score 2 untuk alert
 
 # ── Penyimpanan histori ───────────────────────────────
 volume_history   = defaultdict(list)

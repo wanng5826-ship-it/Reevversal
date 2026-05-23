@@ -1,7 +1,7 @@
 """
 =======================================================
   Binance Whale Accumulation Detector
-  Exchange : Binance (Public API, no key needed)
+  Exchange : KuCoin (Public API, no key needed)
   Deteksi  : Akumulasi whale tahap awal
   Sinyal   :
     1. Volume spike abnormal
@@ -36,7 +36,7 @@ volume_history   = defaultdict(list)
 ask_wall_history = defaultdict(list)
 sent_cache       = {}
 
-BASE_URL = "https://api.binance.com"
+BASE_URL = "https://api.kucoin.com"
 
 # ── Telegram ──────────────────────────────────────────
 def send_telegram(msg):
@@ -60,25 +60,29 @@ def send_telegram(msg):
 # ── Test koneksi ──────────────────────────────────────
 def test_connection():
     try:
-        r = requests.get(f"{BASE_URL}/api/v3/ping", timeout=10)
-        print(f"[TEST] Binance API: OK (status {r.status_code})")
-        return True
+        r = requests.get(f"{BASE_URL}/api/v1/timestamp", timeout=10)
+        data = r.json()
+        if r.status_code == 200 and data.get("code") == "200000":
+            print(f"[TEST] KuCoin API: OK (status {r.status_code})")
+            return True
+        else:
+            print(f"[TEST] KuCoin API: GAGAL (status {r.status_code}, code {data.get('code')})")
+            return False
     except Exception as e:
-        print(f"[TEST] GAGAL akses Binance: {e}")
+        print(f"[TEST] GAGAL akses KuCoin: {e}")
         return False
 
 # ── Ambil semua pair USDT ─────────────────────────────
 def get_all_pairs():
     try:
-        r = requests.get(f"{BASE_URL}/api/v3/exchangeInfo", timeout=15)
+        r = requests.get(f"{BASE_URL}/api/v1/symbols", timeout=15)
         data = r.json()
         pairs = []
-        for s in data.get("symbols", []):
-            if (s["quoteAsset"] == "USDT" and
-                s["status"] == "TRADING" and
-                s["isSpotTradingAllowed"]):
-                pairs.append(s["symbol"])
-        print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di Binance")
+        for s in data.get("data", []):
+            if (s["quoteCurrency"] == "USDT" and
+                s["enableTrading"]):
+                pairs.append(s["symbol"])  # format: BTC-USDT
+        print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di KuCoin")
         return pairs
     except Exception as e:
         print(f"[PAIRS ERROR] {e}")
@@ -87,15 +91,22 @@ def get_all_pairs():
 # ── Ambil ticker 24h ──────────────────────────────────
 def get_ticker(symbol):
     try:
-        r = requests.get(f"{BASE_URL}/api/v3/ticker/24hr",
+        r = requests.get(f"{BASE_URL}/api/v1/market/stats",
                          params={"symbol": symbol}, timeout=8)
-        d = r.json()
+        d = r.json().get("data", {})
+        if not d:
+            return None
+        last = float(d.get("last", 0) or 0)
+        vol  = float(d.get("volValue", 0) or 0)  # sudah dalam USDT
+        high = float(d.get("high", 0) or 0)
+        low  = float(d.get("low", 0) or 0)
+        chg  = float(d.get("changeRate", 0) or 0) * 100
         return {
-            "last"      : float(d.get("lastPrice", 0)),
-            "vol_usdt"  : float(d.get("quoteVolume", 0)),
-            "high"      : float(d.get("highPrice", 0)),
-            "low"       : float(d.get("lowPrice", 0)),
-            "price_chg" : float(d.get("priceChangePercent", 0)),
+            "last"      : last,
+            "vol_usdt"  : vol,
+            "high"      : high,
+            "low"       : low,
+            "price_chg" : chg,
         }
     except:
         return None
@@ -103,9 +114,11 @@ def get_ticker(symbol):
 # ── Ambil order book ──────────────────────────────────
 def get_order_book(symbol, limit=20):
     try:
-        r = requests.get(f"{BASE_URL}/api/v3/depth",
-                         params={"symbol": symbol, "limit": limit}, timeout=8)
-        data = r.json()
+        r = requests.get(f"{BASE_URL}/api/v1/market/orderbook/level2_20",
+                         params={"symbol": symbol}, timeout=8)
+        data = r.json().get("data", {})
+        if not data:
+            return [], []
         bids = [[float(x[0]), float(x[1])] for x in data.get("bids", [])]
         asks = [[float(x[0]), float(x[1])] for x in data.get("asks", [])]
         return bids, asks
@@ -115,14 +128,14 @@ def get_order_book(symbol, limit=20):
 # ── Ambil trade history ───────────────────────────────
 def get_recent_trades(symbol, limit=50):
     try:
-        r = requests.get(f"{BASE_URL}/api/v3/trades",
-                         params={"symbol": symbol, "limit": limit}, timeout=8)
-        trades = r.json()
+        r = requests.get(f"{BASE_URL}/api/v1/market/histories",
+                         params={"symbol": symbol}, timeout=8)
+        trades = r.json().get("data", [])
         result = []
         for t in trades:
             price  = float(t.get("price", 0))
-            qty    = float(t.get("qty", 0))
-            is_buy = not t.get("isBuyerMaker", True)
+            qty    = float(t.get("size", 0))
+            is_buy = t.get("side") == "buy"
             result.append({
                 "type" : "buy" if is_buy else "sell",
                 "price": price,
@@ -212,7 +225,7 @@ def detect_whale_signals(symbol, ticker, bids, asks, trades):
 def format_alert(symbol, ticker, score, signals, bids, asks):
     now_str    = datetime.now().strftime("%H:%M:%S")
     last_price = ticker["last"]
-    coin       = symbol.replace("USDT", "")
+    coin       = symbol.replace("-USDT", "")
 
     support    = bids[0][0] if bids else "-"
     resistance = asks[0][0] if asks else "-"
@@ -236,7 +249,7 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
         f"💰 Harga       : ${last_price}\n"
         f"📈 High 24H    : ${ticker['high']}\n"
         f"📉 Low 24H     : ${ticker['low']}\n"
-        f"📊 Perubahan   : {ticker['price_chg']}%\n"
+        f"📊 Perubahan   : {round(ticker['price_chg'], 2)}%\n"
         f"💹 Volume 24H  : ${int(ticker['vol_usdt']):,}\n"
         f"🛡️ Support     : ${support}\n"
         f"🚧 Resistance  : ${resistance}\n"
@@ -254,6 +267,7 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
 def main():
     print("=" * 55)
     print("  Binance Whale Accumulation Detector")
+    print(f"  Exchange  : KuCoin")
     print(f"  Interval  : {CHECK_INTERVAL}s")
     print(f"  Min Volume: ${MIN_VOLUME_USDT:,} USDT")
     print(f"  Min Score : {SCORE_MIN}")
@@ -263,15 +277,15 @@ def main():
         print("[ERROR] BOT_TOKEN / CHAT_ID belum diset!")
         return
 
-    print("[TEST] Mencoba akses Binance API...")
+    print("[TEST] Mencoba akses KuCoin API...")
     if not test_connection():
-        print("[ERROR] Tidak bisa akses Binance, cek koneksi!")
+        print("[ERROR] Tidak bisa akses KuCoin, cek koneksi!")
         return
 
     send_telegram(
-        "🐋 <b>Whale Detector Binance — ONLINE!</b>\n"
+        "🐋 <b>Whale Detector KuCoin — ONLINE!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 Exchange  : Binance\n"
+        "📊 Exchange  : KuCoin\n"
         "🔍 Deteksi   :\n"
         "   🔥 Volume spike abnormal\n"
         "   🚪 Ask wall tiba-tiba hilang\n"
@@ -305,7 +319,7 @@ def main():
 
     while True:
         now_str = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{now_str}] Scanning semua pair Binance...")
+        print(f"\n[{now_str}] Scanning semua pair KuCoin...")
 
         pairs = get_all_pairs()
         if not pairs:
@@ -356,3 +370,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+      

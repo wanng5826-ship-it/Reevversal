@@ -1,13 +1,14 @@
 """
 =======================================================
-  Indodax Whale Accumulation Detector
-  Exchange : Indodax (Public API, no key needed)
+  Binance Whale Accumulation Detector
+  Exchange : Binance (Public API, no key needed)
   Deteksi  : Akumulasi whale tahap awal
   Sinyal   :
     1. Volume spike abnormal
     2. Ask wall tiba-tiba hilang
     3. Trade besar beruntun
-    4. Bid wall besar muncul tiba-tiba
+    4. Bid wall besar muncul
+    5. Spread ketat
   Notif    : Telegram
 =======================================================
 """
@@ -20,20 +21,22 @@ from collections import defaultdict
 
 BOT_TOKEN      = os.environ.get("BOT_TOKEN", "")
 CHAT_ID        = os.environ.get("CHAT_ID", "")
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "120"))  # 2 menit
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "120"))
 
 # ── Threshold deteksi ─────────────────────────────────
-VOLUME_SPIKE_MULTIPLIER = 3.0    # volume sekarang > 3x rata-rata → spike
-MIN_VOLUME_IDR          = 1_000_000   # min volume 10 juta IDR (termasuk koin kecil)
-WALL_IDR_THRESHOLD      = 500_000   # wall dianggap besar jika > 3 juta IDR
-BIG_TRADE_IDR           = 200_000   # transaksi dianggap besar jika > 1 juta IDR
-BIG_TRADE_COUNT         = 3           # minimal 3 transaksi besar dalam 1 siklus
-SCORE_MIN               = 1           # minimal 2 sinyal terpenuhi untuk alert
+VOLUME_SPIKE_MULTIPLIER = 3.0      # volume > 3x rata-rata → spike
+MIN_VOLUME_USDT         = 100_000  # min volume 100k USDT/hari
+WALL_USDT_THRESHOLD     = 50_000   # wall besar jika > 50k USDT
+BIG_TRADE_USDT          = 10_000   # transaksi besar jika > 10k USDT
+BIG_TRADE_COUNT         = 3        # minimal 3 transaksi besar
+SCORE_MIN               = 2        # minimal score 2 untuk alert
 
 # ── Penyimpanan histori ───────────────────────────────
-volume_history  = defaultdict(list)   # histori volume per coin
-ask_wall_history= defaultdict(list)   # histori total ask wall per coin
-sent_cache      = {}                  # cache sinyal terakhir per coin
+volume_history   = defaultdict(list)
+ask_wall_history = defaultdict(list)
+sent_cache       = {}
+
+BASE_URL = "https://api.binance.com"
 
 # ── Telegram ──────────────────────────────────────────
 def send_telegram(msg):
@@ -50,79 +53,81 @@ def send_telegram(msg):
         if r.status_code == 200:
             print(f"[TELEGRAM] ✅ Terkirim")
         else:
-            print(f"[TELEGRAM] ❌ {r.text}")
+            print(f"[TELEGRAM] ❌ {r.text[:100]}")
     except Exception as e:
         print(f"[TELEGRAM] ❌ {e}")
 
-# ── Ambil semua pair IDR ──────────────────────────────
+# ── Test koneksi ──────────────────────────────────────
+def test_connection():
+    try:
+        r = requests.get(f"{BASE_URL}/api/v3/ping", timeout=10)
+        print(f"[TEST] Binance API: OK (status {r.status_code})")
+        return True
+    except Exception as e:
+        print(f"[TEST] GAGAL akses Binance: {e}")
+        return False
+
+# ── Ambil semua pair USDT ─────────────────────────────
 def get_all_pairs():
     try:
-        r = requests.get("https://indodax.com/api/pairs", timeout=10)
+        r = requests.get(f"{BASE_URL}/api/v3/exchangeInfo", timeout=15)
         data = r.json()
         pairs = []
-        for p in data:
-            if p.get("quote_currency", "").lower() == "idr":
-                pairs.append({
-                    "pair_id"  : p["id"],
-                    "symbol"   : p["base_currency"].upper(),
-                    "ticker_id": p["ticker_id"],
-                })
+        for s in data.get("symbols", []):
+            if (s["quoteAsset"] == "USDT" and
+                s["status"] == "TRADING" and
+                s["isSpotTradingAllowed"]):
+                pairs.append(s["symbol"])
+        print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di Binance")
         return pairs
     except Exception as e:
         print(f"[PAIRS ERROR] {e}")
         return []
 
-def test_connection():
-    """Test apakah Indodax bisa diakses"""
+# ── Ambil ticker 24h ──────────────────────────────────
+def get_ticker(symbol):
     try:
-        r = requests.get("https://indodax.com/api/pairs", timeout=10)
-        print(f"[TEST] Status: {r.status_code} | Size: {len(r.text)} bytes")
-        data = r.json()
-        print(f"[TEST] Berhasil ambil {len(data)} pair dari Indodax")
-        return True
-    except Exception as e:
-        print(f"[TEST] GAGAL akses Indodax: {e}")
-        return False
-
-# ── Ambil ticker ──────────────────────────────────────
-def get_ticker(ticker_id):
-    try:
-        r = requests.get(f"https://indodax.com/api/ticker/{ticker_id}", timeout=8)
-        d = r.json().get("ticker", {})
+        r = requests.get(f"{BASE_URL}/api/v3/ticker/24hr",
+                         params={"symbol": symbol}, timeout=8)
+        d = r.json()
         return {
-            "last"   : float(d.get("last", 0)),
-            "vol_idr": float(d.get("vol_idr", 0)),
-            "high"   : float(d.get("high", 0)),
-            "low"    : float(d.get("low", 0)),
-            "buy"    : float(d.get("buy", 0)),
-            "sell"   : float(d.get("sell", 0)),
+            "last"      : float(d.get("lastPrice", 0)),
+            "vol_usdt"  : float(d.get("quoteVolume", 0)),
+            "high"      : float(d.get("highPrice", 0)),
+            "low"       : float(d.get("lowPrice", 0)),
+            "price_chg" : float(d.get("priceChangePercent", 0)),
         }
     except:
         return None
 
 # ── Ambil order book ──────────────────────────────────
-def get_order_book(pair_id):
+def get_order_book(symbol, limit=20):
     try:
-        r = requests.get(f"https://indodax.com/api/{pair_id}/depth", timeout=8)
+        r = requests.get(f"{BASE_URL}/api/v3/depth",
+                         params={"symbol": symbol, "limit": limit}, timeout=8)
         data = r.json()
-        bids = [[float(x[0]), float(x[1])] for x in data.get("buy", [])]
-        asks = [[float(x[0]), float(x[1])] for x in data.get("sell", [])]
+        bids = [[float(x[0]), float(x[1])] for x in data.get("bids", [])]
+        asks = [[float(x[0]), float(x[1])] for x in data.get("asks", [])]
         return bids, asks
     except:
         return [], []
 
 # ── Ambil trade history ───────────────────────────────
-def get_trade_history(pair_id):
+def get_recent_trades(symbol, limit=50):
     try:
-        r = requests.get(f"https://indodax.com/api/{pair_id}/trades", timeout=8)
+        r = requests.get(f"{BASE_URL}/api/v3/trades",
+                         params={"symbol": symbol, "limit": limit}, timeout=8)
         trades = r.json()
         result = []
         for t in trades:
+            price  = float(t.get("price", 0))
+            qty    = float(t.get("qty", 0))
+            is_buy = not t.get("isBuyerMaker", True)
             result.append({
-                "type"    : t.get("type", ""),
-                "price"   : float(t.get("price", 0)),
-                "amount"  : float(t.get("amount", 0)),
-                "idr"     : float(t.get("price", 0)) * float(t.get("amount", 0)),
+                "type" : "buy" if is_buy else "sell",
+                "price": price,
+                "qty"  : qty,
+                "usdt" : price * qty,
             })
         return result
     except:
@@ -132,19 +137,18 @@ def get_trade_history(pair_id):
 def detect_whale_signals(symbol, ticker, bids, asks, trades):
     signals = []
     score   = 0
-    last_price = ticker["last"]
-    vol_idr    = ticker["vol_idr"]
+    vol_usdt = ticker["vol_usdt"]
 
     # ── 1. Volume Spike ───────────────────────────────
     hist = volume_history[symbol]
-    hist.append(vol_idr)
+    hist.append(vol_usdt)
     if len(hist) > 20:
         hist.pop(0)
 
     if len(hist) >= 5:
         avg_vol = sum(hist[:-1]) / len(hist[:-1])
         if avg_vol > 0:
-            ratio = vol_idr / avg_vol
+            ratio = vol_usdt / avg_vol
             if ratio >= VOLUME_SPIKE_MULTIPLIER:
                 signals.append(f"🔥 Volume spike <b>{round(ratio,1)}x</b> dari rata-rata")
                 score += 2
@@ -153,9 +157,8 @@ def detect_whale_signals(symbol, ticker, bids, asks, trades):
                 score += 1
 
     # ── 2. Ask Wall Hilang ────────────────────────────
-    top_asks    = asks[:15]
-    total_ask   = sum(p * q for p, q in top_asks)
-    ask_hist    = ask_wall_history[symbol]
+    total_ask  = sum(p * q for p, q in asks[:15])
+    ask_hist   = ask_wall_history[symbol]
     ask_hist.append(total_ask)
     if len(ask_hist) > 10:
         ask_hist.pop(0)
@@ -165,40 +168,43 @@ def detect_whale_signals(symbol, ticker, bids, asks, trades):
         if prev_ask_avg > 0:
             ask_ratio = total_ask / prev_ask_avg
             if ask_ratio < 0.4:
-                signals.append(f"🚪 Ask wall turun drastis (<b>{round((1-ask_ratio)*100)}%</b> hilang) — penjual mundur")
+                signals.append(f"🚪 Ask wall hilang <b>{round((1-ask_ratio)*100)}%</b> — penjual mundur")
                 score += 2
             elif ask_ratio < 0.6:
-                signals.append(f"📉 Ask wall menipis (<b>{round((1-ask_ratio)*100)}%</b> berkurang)")
+                signals.append(f"📉 Ask wall menipis <b>{round((1-ask_ratio)*100)}%</b>")
                 score += 1
 
     # ── 3. Bid Wall Besar Muncul ──────────────────────
-    big_bids = [(p, p*q) for p, q in bids[:15] if p*q >= WALL_IDR_THRESHOLD]
+    big_bids = [(p, p*q) for p, q in bids[:15] if p*q >= WALL_USDT_THRESHOLD]
     if big_bids:
-        total_big_bid = sum(idr for _, idr in big_bids)
-        signals.append(f"💚 Bid wall besar: <b>{len(big_bids)} level</b> total {int(total_big_bid/1_000_000)}jt IDR")
+        total_big_bid = sum(usdt for _, usdt in big_bids)
+        signals.append(f"💚 Bid wall besar: <b>{len(big_bids)} level</b> total ${int(total_big_bid):,}")
         score += 1
-        if total_big_bid >= WALL_IDR_THRESHOLD * 5:
-            score += 1  # bonus kalau sangat besar
+        if total_big_bid >= WALL_USDT_THRESHOLD * 5:
+            score += 1
 
     # ── 4. Transaksi Beli Besar Beruntun ──────────────
-    recent_trades = trades[:30]  # 30 transaksi terakhir
-    big_buys = [t for t in recent_trades if t["type"] == "buy" and t["idr"] >= BIG_TRADE_IDR]
-    big_sells= [t for t in recent_trades if t["type"] == "sell" and t["idr"] >= BIG_TRADE_IDR]
-
+    big_buys = [t for t in trades if t["type"] == "buy" and t["usdt"] >= BIG_TRADE_USDT]
     if len(big_buys) >= BIG_TRADE_COUNT:
-        total_big_buy = sum(t["idr"] for t in big_buys)
-        signals.append(f"🐋 <b>{len(big_buys)} transaksi beli besar</b> total {int(total_big_buy/1_000_000)}jt IDR")
+        total_big_buy = sum(t["usdt"] for t in big_buys)
+        signals.append(f"🐋 <b>{len(big_buys)} transaksi beli besar</b> total ${int(total_big_buy):,}")
         score += 2
 
-    # ── 5. Spread ketat (pembeli agresif) ─────────────
+    # ── 5. Spread ketat ───────────────────────────────
     if bids and asks:
         best_bid = bids[0][0]
         best_ask = asks[0][0]
         if best_ask > 0:
             spread_pct = (best_ask - best_bid) / best_ask * 100
-            if spread_pct < 0.5:
-                signals.append(f"⚡ Spread sangat ketat <b>{round(spread_pct,2)}%</b> — pembeli agresif")
+            if spread_pct < 0.05:
+                signals.append(f"⚡ Spread sangat ketat <b>{round(spread_pct,3)}%</b> — pembeli agresif")
                 score += 1
+
+    # ── 6. Harga naik signifikan 24H ─────────────────
+    chg = ticker["price_chg"]
+    if chg >= 10:
+        signals.append(f"🚀 Harga naik <b>+{round(chg,1)}%</b> dalam 24H")
+        score += 1
 
     return score, signals
 
@@ -206,11 +212,8 @@ def detect_whale_signals(symbol, ticker, bids, asks, trades):
 def format_alert(symbol, ticker, score, signals, bids, asks):
     now_str    = datetime.now().strftime("%H:%M:%S")
     last_price = ticker["last"]
-    high_24h   = ticker["high"]
-    low_24h    = ticker["low"]
-    vol_idr    = ticker["vol_idr"]
+    coin       = symbol.replace("USDT", "")
 
-    # Level support & resistance dari order book
     support    = bids[0][0] if bids else "-"
     resistance = asks[0][0] if asks else "-"
 
@@ -227,21 +230,22 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
         emoji = "👀"
 
     msg = (
-        f"{emoji} <b>WHALE DETECTOR — {symbol}/IDR</b>\n"
+        f"{emoji} <b>WHALE DETECTOR — {coin}/USDT</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱️ Waktu      : {now_str}\n"
-        f"💰 Harga      : {int(last_price):,} IDR\n"
-        f"📈 High 24H   : {int(high_24h):,} IDR\n"
-        f"📉 Low 24H    : {int(low_24h):,} IDR\n"
-        f"💹 Volume 24H : {int(vol_idr/1_000_000)} jt IDR\n"
-        f"🛡️ Support    : {int(support):,} IDR\n"
-        f"🚧 Resistance : {int(resistance):,} IDR\n"
+        f"⏱️ Waktu       : {now_str}\n"
+        f"💰 Harga       : ${last_price}\n"
+        f"📈 High 24H    : ${ticker['high']}\n"
+        f"📉 Low 24H     : ${ticker['low']}\n"
+        f"📊 Perubahan   : {ticker['price_chg']}%\n"
+        f"💹 Volume 24H  : ${int(ticker['vol_usdt']):,}\n"
+        f"🛡️ Support     : ${support}\n"
+        f"🚧 Resistance  : ${resistance}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎯 <b>Score: {score} | {alert_level}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Sinyal yang terdeteksi:</b>\n{signal_text}\n"
+        f"<b>Sinyal terdeteksi:</b>\n{signal_text}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"⚠️ Ini deteksi akumulasi awal, bukan jaminan pump!\n"
+        f"⚠️ Deteksi akumulasi awal, bukan jaminan pump!\n"
         f"💡 Selalu gunakan risk management!"
     )
     return msg
@@ -249,49 +253,59 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
 # ── Main loop ─────────────────────────────────────────
 def main():
     print("=" * 55)
-    print("  Indodax Whale Accumulation Detector")
-    print(f"  Interval : {CHECK_INTERVAL}s")
-    print(f"  Min Score: {SCORE_MIN} sinyal")
+    print("  Binance Whale Accumulation Detector")
+    print(f"  Interval  : {CHECK_INTERVAL}s")
+    print(f"  Min Volume: ${MIN_VOLUME_USDT:,} USDT")
+    print(f"  Min Score : {SCORE_MIN}")
     print("=" * 55)
 
     if not BOT_TOKEN or not CHAT_ID:
         print("[ERROR] BOT_TOKEN / CHAT_ID belum diset!")
         return
 
+    print("[TEST] Mencoba akses Binance API...")
+    if not test_connection():
+        print("[ERROR] Tidak bisa akses Binance, cek koneksi!")
+        return
+
     send_telegram(
-        "🐋 <b>Whale Detector — ONLINE!</b>\n"
+        "🐋 <b>Whale Detector Binance — ONLINE!</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 Exchange  : Indodax\n"
+        "📊 Exchange  : Binance\n"
         "🔍 Deteksi   :\n"
         "   🔥 Volume spike abnormal\n"
         "   🚪 Ask wall tiba-tiba hilang\n"
         "   💚 Bid wall besar muncul\n"
         "   🐋 Transaksi beli besar beruntun\n"
-        "   ⚡ Spread ketat (pembeli agresif)\n"
+        "   ⚡ Spread ketat\n"
+        "   🚀 Harga naik signifikan\n"
         f"⏱️ Interval  : setiap {CHECK_INTERVAL//60} menit\n"
+        f"💰 Min Volume: ${MIN_VOLUME_USDT:,} USDT/hari\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Bot berjalan di Railway!"
     )
 
-    # Warmup: 2 siklus pertama untuk bangun histori
+    # Warmup
     print("[WARMUP] Membangun histori data awal...")
     pairs = get_all_pairs()
-    for p in pairs:
+    count = 0
+    for symbol in pairs[:50]:  # warmup 50 coin dulu
         try:
-            ticker = get_ticker(p["ticker_id"])
-            if ticker and ticker["vol_idr"] >= MIN_VOLUME_IDR:
-                volume_history[p["symbol"]].append(ticker["vol_idr"])
-                _, asks = get_order_book(p["pair_id"])
-                total_ask = sum(float(x[0])*float(x[1]) for x in asks[:15]) if asks else 0
-                ask_wall_history[p["symbol"]].append(total_ask)
+            ticker = get_ticker(symbol)
+            if ticker and ticker["vol_usdt"] >= MIN_VOLUME_USDT:
+                volume_history[symbol].append(ticker["vol_usdt"])
+                _, asks = get_order_book(symbol)
+                total_ask = sum(p*q for p,q in asks[:15]) if asks else 0
+                ask_wall_history[symbol].append(total_ask)
+                count += 1
         except:
             continue
-    print(f"[WARMUP] Selesai, {len(volume_history)} coin ditrack")
+    print(f"[WARMUP] Selesai, {count} coin ditrack")
     time.sleep(CHECK_INTERVAL)
 
     while True:
         now_str = datetime.now().strftime("%H:%M:%S")
-        print(f"\n[{now_str}] Scanning semua pair Indodax...")
+        print(f"\n[{now_str}] Scanning semua pair Binance...")
 
         pairs = get_all_pairs()
         if not pairs:
@@ -300,30 +314,26 @@ def main():
 
         alerts_sent = 0
 
-        for p in pairs:
-            pair_id   = p["pair_id"]
-            symbol    = p["symbol"]
-            ticker_id = p["ticker_id"]
-
+        for symbol in pairs:
             try:
-                ticker = get_ticker(ticker_id)
-                if ticker is None or ticker["vol_idr"] < MIN_VOLUME_IDR:
+                ticker = get_ticker(symbol)
+                if ticker is None or ticker["vol_usdt"] < MIN_VOLUME_USDT:
                     continue
 
-                bids, asks = get_order_book(pair_id)
+                bids, asks = get_order_book(symbol)
                 if not bids or not asks:
                     continue
 
-                trades = get_trade_history(pair_id)
-
+                trades = get_recent_trades(symbol)
                 score, signals = detect_whale_signals(symbol, ticker, bids, asks, trades)
 
-                print(f"[{symbol}] Score: {score} | Signals: {len(signals)}")
+                if score > 0:
+                    print(f"[{symbol}] Score: {score} | {len(signals)} sinyal")
 
                 if score < SCORE_MIN:
                     continue
 
-                # Anti spam: cooldown 30 menit per coin
+                # Cooldown 30 menit per coin
                 last_sent = sent_cache.get(symbol, 0)
                 if time.time() - last_sent < 1800:
                     print(f"[{symbol}] Cooldown aktif, skip")
@@ -335,7 +345,7 @@ def main():
                 alerts_sent += 1
                 print(f"[{symbol}] ✅ Alert dikirim! Score: {score}")
 
-                time.sleep(1)
+                time.sleep(0.5)
 
             except Exception as e:
                 print(f"[ERROR] {symbol}: {e}")
@@ -346,4 +356,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-      

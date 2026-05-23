@@ -37,6 +37,7 @@ ask_wall_history = defaultdict(list)
 sent_cache       = {}
 
 BASE_URL = "https://api.kucoin.com"
+BLACKLIST = {"USDC", "BUSD", "TUSD", "FDUSD", "USDP", "DAI", "USDD"}
 
 # ── Telegram ──────────────────────────────────────────
 def send_telegram(msg):
@@ -80,7 +81,8 @@ def get_all_pairs():
         pairs = []
         for s in data.get("data", []):
             if (s["quoteCurrency"] == "USDT" and
-                s["enableTrading"]):
+                s["enableTrading"] and
+                s["baseCurrency"] not in BLACKLIST):
                 pairs.append(s["symbol"])  # format: BTC-USDT
         print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di KuCoin")
         return pairs

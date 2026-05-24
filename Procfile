@@ -1,1 +1,1 @@
-worker: python whale_detector_binance.py
+worker: python whale_detector_kucoin.py

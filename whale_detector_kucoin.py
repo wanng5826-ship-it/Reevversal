@@ -36,7 +36,15 @@ MIN_VOLUME_USDT         = 100_000  # min volume 100k USDT/hari
 WALL_USDT_THRESHOLD     = 50_000   # wall besar jika > 50k USDT
 BIG_TRADE_USDT          = 10_000   # transaksi besar jika > 10k USDT
 BIG_TRADE_COUNT         = 3        # minimal 3 transaksi besar
-SCORE_MIN               = 2        # minimal score 2 untuk alert
+SCORE_MIN               = 4        # minimal score 4 untuk alert
+
+# ── Filter stablecoin & non-tradeable ─────────────────
+EXCLUDED_COINS = {
+    "USDS", "USD1", "USDC", "BUSD", "TUSD", "USDP",
+    "FDUSD", "DAI", "FRAX", "GUSD", "USDD", "HUSD",
+    "CUSD", "EURS", "EURT", "ALUSD", "LUSD", "SUSD",
+    "USDJ", "USDK", "USDX", "AUSD", "MUSD", "OUSD",
+}
 
 # ── Penyimpanan histori ───────────────────────────────
 volume_history   = defaultdict(list)
@@ -46,7 +54,6 @@ price_history    = defaultdict(list)
 sent_cache       = {}
 sell_sent_cache  = {}
 
-# ── GANTI ke KuCoin ──────────────────────────────────
 BASE_URL = "https://api.kucoin.com"
 
 # ── Telegram ──────────────────────────────────────────
@@ -87,7 +94,9 @@ def get_all_pairs():
         for s in data.get("data", []):
             if (s.get("quoteCurrency") == "USDT" and
                 s.get("enableTrading") == True):
-                pairs.append(s["symbol"])  # format: BTC-USDT
+                base = s.get("baseCurrency", "")
+                if base not in EXCLUDED_COINS:
+                    pairs.append(s["symbol"])  # format: BTC-USDT
         print(f"[PAIRS] Ditemukan {len(pairs)} pair USDT di KuCoin")
         return pairs
     except Exception as e:
@@ -100,11 +109,10 @@ def get_ticker(symbol):
         r = requests.get(f"{BASE_URL}/api/v1/market/stats",
                          params={"symbol": symbol}, timeout=8)
         d = r.json().get("data", {})
-        # changeRate di KuCoin bentuknya decimal (0.05 = 5%), kali 100
         change_rate = float(d.get("changeRate", 0) or 0) * 100
         return {
             "last"      : float(d.get("last", 0) or 0),
-            "vol_usdt"  : float(d.get("volValue", 0) or 0),  # volume dalam USDT
+            "vol_usdt"  : float(d.get("volValue", 0) or 0),
             "high"      : float(d.get("high", 0) or 0),
             "low"       : float(d.get("low", 0) or 0),
             "price_chg" : change_rate,
@@ -133,8 +141,8 @@ def get_recent_trades(symbol, limit=50):
         result = []
         for t in trades[:limit]:
             price  = float(t.get("price", 0))
-            qty    = float(t.get("size", 0))   # KuCoin pakai "size" bukan "qty"
-            is_buy = t.get("side", "") == "buy" # KuCoin langsung ada "side": "buy"/"sell"
+            qty    = float(t.get("size", 0))
+            is_buy = t.get("side", "") == "buy"
             result.append({
                 "type" : "buy" if is_buy else "sell",
                 "price": price,
@@ -306,7 +314,7 @@ def detect_distribution_signals(symbol, ticker, bids, asks, trades):
 def format_sell_alert(symbol, ticker, score, signals, bids, asks):
     now_str    = datetime.now().strftime("%H:%M:%S")
     last_price = ticker["last"]
-    coin       = symbol.replace("-USDT", "")  # BTC-USDT → BTC
+    coin       = symbol.replace("-USDT", "")
 
     support    = bids[0][0] if bids else "-"
     resistance = asks[0][0] if asks else "-"
@@ -316,7 +324,7 @@ def format_sell_alert(symbol, ticker, score, signals, bids, asks):
     if score >= 5:
         alert_level = "🔴 DISTRIBUSI KUAT — SEGERA JUAL!"
         emoji = "🔴"
-    elif score >= 3:
+    elif score >= 4:
         alert_level = "🟠 DISTRIBUSI TERDETEKSI — PERTIMBANGKAN JUAL"
         emoji = "🟠"
     else:
@@ -348,7 +356,7 @@ def format_sell_alert(symbol, ticker, score, signals, bids, asks):
 def format_alert(symbol, ticker, score, signals, bids, asks):
     now_str    = datetime.now().strftime("%H:%M:%S")
     last_price = ticker["last"]
-    coin       = symbol.replace("-USDT", "")  # BTC-USDT → BTC
+    coin       = symbol.replace("-USDT", "")
 
     support    = bids[0][0] if bids else "-"
     resistance = asks[0][0] if asks else "-"
@@ -358,7 +366,7 @@ def format_alert(symbol, ticker, score, signals, bids, asks):
     if score >= 5:
         alert_level = "🚨 AKUMULASI KUAT"
         emoji = "🚨"
-    elif score >= 3:
+    elif score >= 4:
         alert_level = "⚠️ AKUMULASI TERDETEKSI"
         emoji = "⚠️"
     else:
@@ -423,6 +431,7 @@ def main():
         "   📉 Harga turun dari high 24H\n"
         f"⏱️ Interval  : setiap {CHECK_INTERVAL//60} menit\n"
         f"💰 Min Volume: ${MIN_VOLUME_USDT:,} USDT/hari\n"
+        f"🎯 Min Score : {SCORE_MIN}\n"
         "━━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Bot berjalan di Railway!"
     )
@@ -431,7 +440,7 @@ def main():
     print("[WARMUP] Membangun histori data awal...")
     pairs = get_all_pairs()
     count = 0
-    for symbol in pairs[:50]:  # warmup 50 coin dulu
+    for symbol in pairs[:50]:
         try:
             ticker = get_ticker(symbol)
             if ticker and ticker["vol_usdt"] >= MIN_VOLUME_USDT:
@@ -513,3 +522,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+                              

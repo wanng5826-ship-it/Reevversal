@@ -1,8 +1,8 @@
 from telethon import TelegramClient, events
 
-api_id = 123456        # ganti dengan punyamu
-api_hash = "xxxx"      # ganti dengan punyamu
-BOT_USERNAME = "username_tradbot"  # ganti username Tradbot
+api_id = 36038616
+api_hash = "7a0977625d58d2e0d81c4178f49bff31"
+BOT_USERNAME = "username_tradbot"  # ganti dengan username Tradbot
 
 client = TelegramClient('session', api_id, api_hash)
 
